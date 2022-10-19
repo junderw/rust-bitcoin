@@ -5,6 +5,9 @@
 //! This module contains the [`Witness`] struct and related methods to operate on it
 //!
 
+use core::convert::TryInto;
+use core::ops::Index;
+
 use secp256k1::ecdsa;
 
 use crate::consensus::encode::{Error, MAX_VEC_SIZE};
@@ -13,6 +16,8 @@ use crate::util::sighash::EcdsaSighashType;
 use crate::io::{self, Read, Write};
 use crate::prelude::*;
 use crate::VarInt;
+
+const U32_SIZE: usize = core::mem::size_of::<u32>();
 
 /// The Witness is the data used to unlock bitcoins since the [segwit upgrade](https://github.com/bitcoin/bips/blob/master/bip-0143.mediawiki)
 ///
@@ -33,19 +38,16 @@ pub struct Witness {
     /// like [`Witness::push`] doesn't have case requiring to shift the entire array
     witness_elements: usize,
 
-    /// If `witness_elements > 0` it's a valid index pointing to the last witness element in `content`
-    /// (Including the varint specifying the length of the element)
-    last: usize,
-
-    /// If `witness_elements > 1` it's a valid index pointing to the second-to-last witness element in `content`
-    /// (Including the varint specifying the length of the element)
-    second_to_last: usize,
+    /// This is the valid index pointing to the beginning of the index area. This area is 4 * stack_size bytes
+    /// at the end of the content vector which stores the indices of each item.
+    indices_start: usize,
 }
 
 /// Support structure to allow efficient and convenient iteration over the Witness elements
 pub struct Iter<'a> {
-    inner: core::slice::Iter<'a, u8>,
-    remaining: usize,
+    inner: &'a [u8],
+    indices_start: usize,
+    current_index: usize,
 }
 
 impl Decodable for Witness {
@@ -55,16 +57,13 @@ impl Decodable for Witness {
             Ok(Witness::default())
         } else {
             let mut cursor = 0usize;
-            let mut last = 0usize;
-            let mut second_to_last = 0usize;
 
             // this number should be determined as high enough to cover most witness, and low enough
             // to avoid wasting space without reallocating
             let mut content = vec![0u8; 128];
+            let mut indices = Vec::with_capacity(witness_elements * U32_SIZE);
 
             for _ in 0..witness_elements {
-                second_to_last = last;
-                last = cursor;
                 let element_size_varint = VarInt::consensus_decode(r)?;
                 let element_size_varint_len = element_size_varint.len();
                 let element_size = element_size_varint.0 as usize;
@@ -87,6 +86,10 @@ impl Decodable for Witness {
                     });
                 }
 
+                // Note: We checked required_len is <= MAX_VEC_SIZE
+                // and it is within u32 range.
+                indices.extend((cursor as u32).to_ne_bytes());
+
                 resize_if_needed(&mut content, required_len);
                 element_size_varint
                     .consensus_encode(&mut &mut content[cursor..cursor + element_size_varint_len])?;
@@ -95,13 +98,33 @@ impl Decodable for Witness {
                 cursor += element_size;
             }
             content.truncate(cursor);
+            content.append(&mut indices);
             Ok(Witness {
                 content,
                 witness_elements,
-                last,
-                second_to_last,
+                indices_start: cursor,
             })
         }
+    }
+}
+
+
+/// Safety Requirements: value must always fit within u32
+#[inline]
+fn encode_cursor(bytes: &mut [u8], start_of_indices: usize, index: usize, value: usize) {
+    let start = start_of_indices + index * U32_SIZE;
+    let end = start + U32_SIZE;
+    bytes[start..end].copy_from_slice(&(value as u32).to_ne_bytes()[..]);
+}
+
+#[inline]
+fn decode_cursor(bytes: &[u8], start_of_indices: usize, index: usize) -> Option<usize> {
+    let start = start_of_indices + index * U32_SIZE;
+    let end = start + U32_SIZE;
+    if end > bytes.len() {
+        None
+    } else {
+        Some(u32::from_ne_bytes(bytes[start..end].try_into().expect("is u32 size")) as usize)
     }
 }
 
@@ -119,8 +142,11 @@ impl Encodable for Witness {
     fn consensus_encode<W: Write + ?Sized>(&self, w: &mut W) -> Result<usize, io::Error> {
         let len = VarInt(self.witness_elements as u64);
         len.consensus_encode(w)?;
-        w.emit_slice(&self.content[..])?;
-        Ok(self.content.len() + len.len())
+        let content_with_indices_len = self.content.len();
+        let indices_size = self.witness_elements * U32_SIZE;
+        let content_len = content_with_indices_len - indices_size;
+        w.emit_slice(&self.content[..content_len])?;
+        Ok(content_len + len.len())
     }
 }
 
@@ -133,18 +159,17 @@ impl Witness {
     /// Creates [`Witness`] object from an array of byte-arrays
     pub fn from_vec(vec: Vec<Vec<u8>>) -> Self {
         let witness_elements = vec.len();
+        let index_size = witness_elements * U32_SIZE;
 
         let content_size: usize = vec
             .iter()
             .map(|el| el.len() + VarInt(el.len() as u64).len())
             .sum();
-        let mut content = vec![0u8; content_size];
+        let mut content = vec![0u8; content_size + index_size];
         let mut cursor = 0usize;
-        let mut last = 0;
-        let mut second_to_last = 0;
-        for el in vec {
-            second_to_last = last;
-            last = cursor;
+        for (i, el) in vec.into_iter().enumerate() {
+            encode_cursor(&mut content, content_size, i, cursor);
+
             let el_len_varint = VarInt(el.len() as u64);
             el_len_varint
                 .consensus_encode(&mut &mut content[cursor..cursor + el_len_varint.len()])
@@ -157,8 +182,7 @@ impl Witness {
         Witness {
             witness_elements,
             content,
-            last,
-            second_to_last,
+            indices_start: content_size,
         }
     }
 
@@ -174,7 +198,11 @@ impl Witness {
 
     /// Returns a struct implementing [`Iterator`]
     pub fn iter(&self) -> Iter {
-        Iter { inner: self.content.iter(), remaining: self.witness_elements }
+        Iter {
+            inner: self.content.as_slice(),
+            indices_start: self.indices_start,
+            current_index: 0,
+        }
     }
 
     /// Returns the number of elements this witness holds
@@ -194,25 +222,29 @@ impl Witness {
     pub fn clear(&mut self) {
         self.content.clear();
         self.witness_elements = 0;
-        self.last = 0;
-        self.second_to_last = 0;
+        self.indices_start = 0;
     }
 
     /// Push a new element on the witness, requires an allocation
     pub fn push<T: AsRef<[u8]>>(&mut self, new_element: T) {
         let new_element = new_element.as_ref();
         self.witness_elements += 1;
-        self.second_to_last = self.last;
-        self.last = self.content.len();
+        let previous_content_end = self.indices_start;
         let element_len_varint = VarInt(new_element.len() as u64);
         let current_content_len = self.content.len();
+        let new_item_total_len = element_len_varint.len() + new_element.len();
         self.content
-            .resize(current_content_len + element_len_varint.len() + new_element.len(), 0);
-        let end_varint = current_content_len + element_len_varint.len();
+            .resize(current_content_len + new_item_total_len + U32_SIZE, 0);
+
+        self.content[self.indices_start..].rotate_right(new_item_total_len);
+        self.indices_start += new_item_total_len;
+        encode_cursor(&mut self.content, self.indices_start, self.witness_elements - 1, previous_content_end);
+
+        let end_varint = previous_content_end + element_len_varint.len();
         element_len_varint
-            .consensus_encode(&mut &mut self.content[current_content_len..end_varint])
+            .consensus_encode(&mut &mut self.content[previous_content_end..end_varint])
             .expect("writers on vec don't error, space granted through previous resize");
-        self.content[end_varint..].copy_from_slice(new_element);
+        self.content[end_varint..end_varint + new_element.len()].copy_from_slice(new_element);
     }
 
     /// Pushes a DER-encoded ECDSA signature with a signature hash type as a new element on the
@@ -237,7 +269,7 @@ impl Witness {
         if self.witness_elements == 0 {
             None
         } else {
-            self.element_at(self.last)
+            self.nth(self.witness_elements - 1)
         }
     }
 
@@ -246,8 +278,49 @@ impl Witness {
         if self.witness_elements <= 1 {
             None
         } else {
-            self.element_at(self.second_to_last)
+            self.nth(self.witness_elements - 2)
         }
+    }
+
+    /// Return the nth element in the witness, if any
+    pub fn nth(&self, index: usize) -> Option<&[u8]> {
+        let pos = decode_cursor(&self.content, self.indices_start, index)?;
+        self.element_at(pos)
+    }
+
+    /// Get Tapscript following BIP341 rules regarding accounting for an annex.
+    /// This does not guarantee that this represents a P2TR [`Witness`].
+    /// It merely gets the second to last or third to last element depending
+    /// on the first byte of the last element being equal to 0x50.
+    pub fn get_tapscript(&self) -> Option<&[u8]> {
+        let len = self.len();
+        self
+            .last()
+            .map(|last_elem| {
+                // From BIP341:
+                // If there are at least two witness elements, and the first byte of
+                // the last element is 0x50, this last element is called annex a
+                // and is removed from the witness stack.
+                if len >= 2 && last_elem.get(0).filter(|&&v| v == 0x50).is_some() {
+                    // account for the extra item removed from the end
+                    3
+                } else {
+                    // otherwise script is 2nd from last
+                    2
+                }
+            })
+            .filter(|&script_pos_from_last| len >= script_pos_from_last)
+            .and_then(|script_pos_from_last| {
+                self.nth(len - script_pos_from_last)
+            })
+    }
+}
+
+impl Index<usize> for Witness {
+    type Output = [u8];
+
+    fn index(&self, index: usize) -> &Self::Output {
+        self.nth(index).expect("Out of Bounds")
     }
 }
 
@@ -255,20 +328,19 @@ impl<'a> Iterator for Iter<'a> {
     type Item = &'a [u8];
 
     fn next(&mut self) -> Option<Self::Item> {
-        let varint = VarInt::consensus_decode(&mut self.inner.as_slice()).ok()?;
-        self.inner.nth(varint.len() - 1)?; // VarInt::len returns at least 1
-        let len = varint.0 as usize;
-        let slice = &self.inner.as_slice()[..len];
-        if len > 0 {
-            // we don't need to advance if the element is empty
-            self.inner.nth(len - 1)?;
-        }
-        self.remaining -= 1;
+        let index = decode_cursor(self.inner, self.indices_start, self.current_index)?;
+        let varint = VarInt::consensus_decode(&mut &self.inner[index..]).ok()?;
+        let start = index + varint.len();
+        let end = start + varint.0 as usize;
+        let slice = &self.inner[start..end];
+        self.current_index += 1;
         Some(slice)
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        (self.remaining, Some(self.remaining))
+        let total_count = (self.inner.len() - self.indices_start) / U32_SIZE;
+        let remaining = total_count - self.current_index;
+        (remaining, Some(remaining))
     }
 }
 
@@ -372,9 +444,8 @@ mod test {
         witness.push(&vec![0u8]);
         let expected = Witness {
             witness_elements: 1,
-            content: vec![1u8, 0],
-            last: 0,
-            second_to_last: 0,
+            content: vec![1u8, 0, 0, 0, 0, 0],
+            indices_start: 2,
         };
         assert_eq!(witness, expected);
         assert_eq!(witness.last(), Some(&[0u8][..]));
@@ -382,9 +453,8 @@ mod test {
         witness.push(&vec![2u8, 3u8]);
         let expected = Witness {
             witness_elements: 2,
-            content: vec![1u8, 0, 2, 2, 3],
-            last: 2,
-            second_to_last: 0,
+            content: vec![1u8, 0, 2, 2, 3, 0, 0, 0, 0, 2, 0, 0, 0],
+            indices_start: 5,
         };
         assert_eq!(witness, expected);
         assert_eq!(witness.last(), Some(&[2u8, 3u8][..]));
@@ -428,11 +498,12 @@ mod test {
         let w1 = Vec::from_hex("000000").unwrap();
         let witness_vec = vec![w0.clone(), w1.clone()];
         let witness_serialized: Vec<u8> = serialize(&witness_vec);
+        let mut content = witness_serialized[1..].to_vec();
+        content.extend([0, 0, 0, 0, 34, 0, 0, 0]); // indices 0 and 34
         let witness = Witness {
-            content: witness_serialized[1..].to_vec(),
+            content,
             witness_elements: 2,
-            last: 34,
-            second_to_last: 0,
+            indices_start: 38,
         };
         for (i, el) in witness.iter().enumerate() {
             assert_eq!(witness_vec[i], el);
