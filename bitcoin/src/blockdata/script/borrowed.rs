@@ -165,6 +165,71 @@ impl Script {
         ScriptBuf::new_v1_p2tr(secp, internal_key, Some(merkle_root))
     }
 
+    /// Detect whether this Script is possible a tapscript.
+    ///
+    /// This can be inconclusive if mixed signals are given
+    /// (ie. SIGADD and CHECKMULTISIG are both used)
+    #[inline]
+    pub fn is_tapscript(&self) -> IsTapscript {
+        // Most previous pushdata size if pushdata, None if OP
+        let mut tail_1 = None;
+        // Second to most previous pushdata size if pushdata, None if OP
+        let mut tail_2 = None;
+        let mut yes_count = 0;
+        let mut no_count = 0;
+        // Provably invalid scripts should be inconclusive
+        for inst in self.instructions() {
+            match inst.expect("Not requiring minimal push") {
+                Instruction::Op(op) => {
+                    match op {
+                        OP_CHECKMULTISIG | OP_CHECKMULTISIGVERIFY => no_count += 1,
+                        OP_CHECKSIGADD => {
+                            yes_count += 1;
+                            match tail_1 {
+                                Some(s) if s != 64 && s != 65 => {
+                                    no_count += 1;
+                                }
+                                _ => {}
+                            };
+                        }
+                        OP_CHECKSIG | OP_CHECKSIGVERIFY => {
+                            match tail_2 {
+                                Some(s) if s != 64 && s != 65 => {
+                                    no_count += 1;
+                                }
+                                Some(_) => {
+                                    yes_count += 1;
+                                }
+                                None => {}
+                            };
+                            match tail_1 {
+                                Some(s) if s == 32 => {
+                                    yes_count += 1;
+                                }
+                                Some(_) => {
+                                    no_count += 1;
+                                }
+                                None => {}
+                            };
+                        }
+                        _ => {}
+                    }
+                    tail_2 = tail_1.take();
+                    tail_1 = None;
+                }
+                Instruction::PushBytes(bytes) => {
+                    tail_2 = tail_1.take();
+                    tail_1 = Some(bytes.len());
+                }
+            }
+        }
+        match (yes_count, no_count) {
+            (0, i) if i > 0 => IsTapscript::No,
+            (i, 0) if i > 0 => IsTapscript::Yes,
+            _ => IsTapscript::Inconclusive,
+        }
+    }
+
     /// Returns witness version of the script, if any, assuming the script is a `scriptPubkey`.
     #[inline]
     pub fn witness_version(&self) -> Option<WitnessVersion> {
@@ -522,6 +587,17 @@ impl Script {
         let inner = unsafe { Box::from_raw(rw) };
         ScriptBuf(Vec::from(inner))
     }
+}
+
+/// The result to [`Script::is_tapscript`]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IsTapscript {
+    /// This is definitely a tapscript
+    Yes,
+    /// This is definitely not a tapscript
+    No,
+    /// It is unsure whether or not this is a tapscript
+    Inconclusive,
 }
 
 /// Iterator over bytes of a script

@@ -608,6 +608,33 @@ fn defult_dust_value_tests() {
 }
 
 #[test]
+fn test_is_tapscript() {
+    assert_eq!(
+        Builder::new()
+            .push_opcode(OP_DUP)
+            .push_opcode(OP_HASH160)
+            .push_slice([42; 20])
+            .push_opcode(OP_EQUAL)
+            .into_script()
+            .is_tapscript(),
+        IsTapscript::Inconclusive,
+    );
+    assert_eq!(
+        Builder::new()
+            .push_opcode(OP_PUSHNUM_1)
+            .push_slice([3; 33])
+            .push_slice([3; 33])
+            .push_slice([3; 33])
+            .push_opcode(OP_PUSHNUM_3)
+            .push_opcode(OP_CHECKMULTISIG)
+            .into_script()
+            .is_tapscript(),
+        IsTapscript::No,
+    );
+    
+}
+
+#[test]
 fn test_script_get_sigop_count() {
     assert_eq!(
         Builder::new()
